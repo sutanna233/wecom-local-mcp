@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-OUT = ROOT.parent / "wecom-local-mcp-v1.2.1.zip"
+OUT = ROOT.parent / "wecom-local-mcp-v1.2.2.zip"
 PREFIX = "wecom-local-mcp"
 
 FILES = [

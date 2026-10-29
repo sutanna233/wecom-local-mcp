@@ -29,6 +29,7 @@ MSG_TYPES = {
     2: "文本",
     4: "图片",
     7: "语音",
+    14: "图片",
     15: "图片/文件",
     38: "应用消息",
     40: "通话/音视频",
@@ -348,10 +349,12 @@ def _clean_text(text):
 
 
 def _looks_like_plain_text(data, text):
-    if not text:
+    if not text or b"\x00" in data:
         return False
-    control = sum(1 for b in data if b < 32 and b not in (9, 10, 13))
-    if control / max(len(data), 1) > 0.08:
+    # Plain text may contain whitespace, but any other control byte is strong
+    # evidence of a protobuf/binary envelope. The old 8% threshold let compact
+    # protobuf messages leak field tags into the decoded leading text.
+    if any(b < 32 and b not in (9, 10, 13) for b in data):
         return False
     printable = sum(1 for ch in text if ch.isprintable() or ch in "\n\t")
     return printable / max(len(text), 1) > 0.9
@@ -461,13 +464,15 @@ def decode_content(raw):
     if texts:
         return "\n".join(texts[:12])
 
-    for enc in ("utf-8", "gbk", "utf-16le"):
-        try:
-            text = _clean_text(data.decode(enc, errors="replace"))
-            if text and "\ufffd" not in text[:20]:
-                return text[:2000]
-        except Exception:
-            continue
+    # WXWork text is UTF-8/protobuf. Do not guess GBK or UTF-16 for arbitrary
+    # binary attachments: that produces plausible-looking but meaningless CJK
+    # gibberish. Unknown payloads stay an explicit binary placeholder.
+    try:
+        text = _clean_text(data.decode("utf-8", errors="strict"))
+        if text and _looks_like_plain_text(data, text):
+            return text[:2000]
+    except (UnicodeDecodeError, ValueError):
+        pass
     return f"[二进制内容 {len(data)} 字节]"
 
 
@@ -487,10 +492,40 @@ def _message_type_name(content_type):
     return MSG_TYPES.get(int(content_type or 0), f"未知({content_type})")
 
 
+def _is_binary_placeholder(text):
+    return bool(text and text.startswith("[二进制内容 "))
+
+
+def _is_metadata_only(text):
+    value = (text or "").strip()
+    if len(value) < 2:
+        return True
+    if re.fullmatch(r"[A-Za-z0-9+/]{20,}={0,2}", value):
+        return True
+    return bool(re.fullmatch(r"[0-9a-fA-F]{32,}", value))
+
+
+def _attachment_path(text):
+    if not text:
+        return None
+    first = text.splitlines()[0].strip()
+    if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\|/storage/)[^\r\n]*\.[A-Za-z0-9]{1,8}$", first):
+        return first
+    return None
+
+
 def _display_message_content(content_type, content, extra_content, local_extra_content):
-    text = content or extra_content or local_extra_content
-    if text:
-        return text
+    for candidate in (content, extra_content, local_extra_content):
+        path = _attachment_path(candidate)
+        if path:
+            return path
+    if content and not _is_binary_placeholder(content):
+        return content
+    for candidate in (extra_content, local_extra_content):
+        if candidate and not _is_binary_placeholder(candidate) and not _is_metadata_only(candidate):
+            return candidate
+    if content:
+        return content
     return f"[{_message_type_name(content_type)}]"
 
 

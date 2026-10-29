@@ -235,6 +235,30 @@ class ParserRegressionTests(unittest.TestCase):
         raw = base64.b64decode("CkgIABJECkLlr7nnmoTvvIzlsLHmmK/ov5nkuKrvvIzmr4/lpKnnlKjkuIDnlKjvvIzorqnku5bovoXliqnovoXliqnlt6XkvZw=")
         self.assertEqual(export.decode_content(raw), "对的，就是这个，每天用一用，让他辅助辅助工作")
 
+    def test_compact_protobuf_does_not_use_plaintext_fast_path(self):
+        raw = base64.b64decode("CmwIABJoCmZlaDA454SK5o6l5py65Zmo5Lq65p6q6KGj6ISx6JC96Iez57q/5L2T5YaF6YOo77yM546w5Zy65byC54mp5pyq5Y+K5pe25riF55CG77yM5LiN56ym5ZCINVPnrqHnkIbopoHmsYI=")
+        self.assertEqual(
+            export.decode_content(raw),
+            "eh08焊接机器人枪衣脱落至线体内部，现场异物未及时清理，不符合5S管理要求",
+        )
+
+    def test_image_binary_uses_local_path_instead_of_gibberish(self):
+        raw = base64.b64decode(
+            "CtYBMzA2OTAyMDEwMjA0NjIzMDYwMDIwMTAwMDIwNGM5NzdkOTNkMDIwMzBmNGRmYTAyMDQxNTI4OTQ5ZDAyMDQ2YWFkMjU4MTA0MjQ2MjM5MzUzNTM5MzQzNTM5MmQ2MTM5MzAzNTJkMzQ2MjM0NjMyZDYxMzEzMDY1MmQ2NDM1NjM2NDM3MzM2MjY1NjMzNDMzMzYwMjAxMDAwMjAzMjAwYzEwMDQxMGNiN2ZlNzVlMWQyZjliM2JjODY4ZjdlYjJlOTdlZDliMDIwMTAyMDIwMTAwMDQwMBoAII2YgAEowBYw8BBCIDQ3ZjMxZDcyZGZhZGE0YzVjMTRkYTIwZmViM2FhMDZhUiBjYjdmZTc1ZTFkMmY5YjNiYzg2OGY3ZWIyZTk3ZWQ5YrgBtqkC2AG2qQLgAZAD6AGsAvIBIGE3NGYwOWMxMmMwOGM1MzU1OWVmNWQ4NmNkOGM1ZGQx"
+        )
+        decoded = export.decode_content(raw)
+        self.assertTrue(decoded.startswith("[二进制内容"), decoded)
+        path = r"D:\Backup\Documents\WXWork\Cache\Image\example.jpg"
+        local = path + "\n3069020102046230600201000204c977d93d02030f4dfa"
+        self.assertEqual(export._display_message_content(14, decoded, "CAQQgcu01QYYvbLfy5yAgAMglrSWzAs=", local), path)
+        self.assertIsNone(export._attachment_path(""))
+
+    def test_control_message_does_not_fall_back_to_base64_or_one_letter(self):
+        raw = base64.b64decode("CgcIBRIDEgEg")
+        decoded = export.decode_content(raw)
+        self.assertEqual(decoded, "[二进制内容 9 字节]")
+        self.assertEqual(export._display_message_content(0, decoded, "CAMQuOOF1wYYxIn31pSAgAMgtrbO8g8=", "p"), decoded)
+
     def test_real_leading_letter_is_preserved(self):
         raw = bytes.fromhex("0a130800120f0a0d61e7 8f ade5a1abe5ae8ce4ba86".replace(" ", ""))
         self.assertEqual(export.decode_content(raw), "a班填完了")

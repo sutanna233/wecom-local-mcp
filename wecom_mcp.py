@@ -20,7 +20,7 @@ DB_PATH = Path(os.environ.get("WECOM_MCP_DB", str(ROOT / "data" / "wecom_message
 SYNC_CONFIG = Path(os.environ.get("WECOM_CONFIG", str(ROOT / "third_party" / "wecom-decrypt" / "config.json")))
 READ_ONLY = os.environ.get("WECOM_MCP_READ_ONLY", "1").lower() not in {"0", "false", "no"}
 SERVER_NAME = "wecom-local-messages"
-SERVER_VERSION = "1.2.1"
+SERVER_VERSION = "1.2.2"
 PROTOCOL_VERSION = "2024-11-05"
 MSG_TYPES = {
     0: "文本/混合",
