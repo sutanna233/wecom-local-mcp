@@ -368,7 +368,11 @@ def _decode_text_segment(segment):
     except UnicodeDecodeError:
         return None
     text = _clean_text(text)
-    if len(text) < 2:
+    if not text:
+        return None
+    # A one-character message is valid (including CJK/emoji), but a longer
+    # binary segment cleaned down to one letter is usually structural noise.
+    if len(text) == 1 and len(segment) > 4:
         return None
     if re.fullmatch(r"[0-9a-fA-F]{32,}", text):
         return None

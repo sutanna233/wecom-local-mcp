@@ -6,12 +6,13 @@
 
 - 16 个加密数据库通过密钥校验；快照通过 SQLite `integrity_check`。
 - WAL 校验 header/frame checksum，只应用到最近 commit，并按 commit `dbsize` 截断。
-- 本次源消息表共 12,938 行；规范化后 **12,916 条消息**，移除 22 条重复记录。
+- 本次源消息表共 12,939 行；规范化后 **12,917 条消息**，移除 22 条重复记录。
 - 共 192 个有消息的会话；`msgid` 无重复，`sender_id` 全部写入，`msgtype` 物理类型为 INTEGER。
 - MCP 的 initialize、tools/list、tools/call、JSON-RPC batch、中文搜索、完整读取、分页和强制 GBK 环境下的 UTF-8 stdio 均已验证。
 - 离线 DB/WAL 复制、checkpoint、完整性及 schema 校验均有合成回归测试。
 - v1.2.1 修正 protobuf 嵌套字段解析：不再把字段标签当成正文首字母，同时避免把正常文件名误判为 protobuf。
 - v1.2.2 收紧纯文本快速通道，修复 `eh08` 等紧凑 protobuf 残留前缀；图片等二进制消息不再猜测 GBK/UTF-16，优先显示清理后的本地附件路径。
+- v1.2.3 恢复单字消息解析，ASCII、中文和 emoji 单字不再退化为二进制占位。
 
 这些数字是本次验证时的快照，不代表服务器上的全部历史或其他账号的数据；后续新消息会改变总数。
 

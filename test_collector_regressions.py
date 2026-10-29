@@ -235,6 +235,19 @@ class ParserRegressionTests(unittest.TestCase):
         raw = base64.b64decode("CkgIABJECkLlr7nnmoTvvIzlsLHmmK/ov5nkuKrvvIzmr4/lpKnnlKjkuIDnlKjvvIzorqnku5bovoXliqnovoXliqnlt6XkvZw=")
         self.assertEqual(export.decode_content(raw), "对的，就是这个，每天用一用，让他辅助辅助工作")
 
+    def test_single_ascii_character_message_is_not_degraded(self):
+        raw = bytes.fromhex("0a07080012030a014f")
+        self.assertEqual(export.decode_content(raw), "O")
+
+    def test_single_cjk_and_emoji_messages_are_not_degraded(self):
+        for text in ("好", "👍"):
+            encoded = text.encode("utf-8")
+            inner = b"\x0a" + bytes([len(encoded)]) + encoded
+            second = b"\x12" + bytes([len(inner)]) + inner
+            first = b"\x08\x00" + second
+            raw = b"\x0a" + bytes([len(first)]) + first
+            self.assertEqual(export.decode_content(raw), text)
+
     def test_compact_protobuf_does_not_use_plaintext_fast_path(self):
         raw = base64.b64decode("CmwIABJoCmZlaDA454SK5o6l5py65Zmo5Lq65p6q6KGj6ISx6JC96Iez57q/5L2T5YaF6YOo77yM546w5Zy65byC54mp5pyq5Y+K5pe25riF55CG77yM5LiN56ym5ZCINVPnrqHnkIbopoHmsYI=")
         self.assertEqual(
