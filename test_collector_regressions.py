@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import sqlite3
 import sys
 import tempfile
@@ -227,6 +228,23 @@ class CollectorTests(unittest.TestCase):
             payload = json.loads(files[0].read_text(encoding="utf-8"))
             self.assertEqual(payload["message_count"], 2)
             self.assertEqual(len({msg["msgid"] for msg in payload["messages"]}), 2)
+
+
+class ParserRegressionTests(unittest.TestCase):
+    def test_protobuf_tag_is_not_part_of_chinese_text(self):
+        raw = base64.b64decode("CkgIABJECkLlr7nnmoTvvIzlsLHmmK/ov5nkuKrvvIzmr4/lpKnnlKjkuIDnlKjvvIzorqnku5bovoXliqnovoXliqnlt6XkvZw=")
+        self.assertEqual(export.decode_content(raw), "对的，就是这个，每天用一用，让他辅助辅助工作")
+
+    def test_real_leading_letter_is_preserved(self):
+        raw = bytes.fromhex("0a130800120f0a0d61e7 8f ade5a1abe5ae8ce4ba86".replace(" ", ""))
+        self.assertEqual(export.decode_content(raw), "a班填完了")
+
+    def test_plain_filename_is_not_misread_as_protobuf(self):
+        filename = "2026.10.9打磨手指割伤事故分析--四不放过分析(1).doc"
+        raw = base64.b64decode(
+            "CrACMzA4MTk1MDIwMTAyMDQ4MThkMzA4MThhMDIwMTAwMDIwNDVjYzI4ZWQwMDIwMzBmNDI0MjAyMDRmMDkxNTA3MDAyMDQ2YWM5ZWY0NjA0NGM0ZTQ1NTc0OTQ0MzE1ZjY0Mzc2NDY0MzAzOTM4NjM2NjMwMzkzMTM1MzAzNzMwMzY2MTYzNjEzMDMxMzEzODMwMzAzMDM2MzMzNDM3Mzg1ZjYzMzkzMTY2NjIzNTMzNjUyZDMxNjU2MjMxMmQzNDM5NjIzMzJkNjEzNjYyMzUyZDYzMzE2MTMxMzczMTM3Mzg2NTY1MzMzNzAyMDMxMDAwMDUwMjAzMDA4ODEwMDQxMGQyYjI5Nzk2NTEyOTNlMzIwYmVkYWIyNmFmM2QzNDM2MDIwMTA1MDIwMTAwMDQwMBJCMjAyNi4xMC455omT56Oo5omL5oyH5Ymy5Lyk5LqL5pWF5YiG5p6QLS3lm5vkuI3mlL7ov4fliIbmnpAoMSkuZG9jIICQAkIgMzUzNTYxNjMzNTY1MzAzNTM3NjQzNDM2MzIzODM5NjFSIGQyYjI5Nzk2NTEyOTNlMzIwYmVkYWIyNmFmM2QzNDM2cAB4AIIBAIoBAJIBAJgBgJAC4gIDZG9jogYA"
+        )
+        self.assertTrue(export.decode_content(raw).startswith(filename), export.decode_content(raw))
 
 
 class WatchRetryTests(unittest.TestCase):

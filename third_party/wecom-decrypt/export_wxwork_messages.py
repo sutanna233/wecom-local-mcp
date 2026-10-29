@@ -375,6 +375,18 @@ def _decode_text_segment(segment):
     return text
 
 
+def _prefer_nested_protobuf(segment, text):
+    """Only recurse when structural evidence outweighs plain-text evidence.
+
+    Some ordinary filenames happen to be valid protobuf byte streams. A field
+    tag at the first byte, or a protocol-tag letter glued to a URL, is much
+    stronger evidence than protobuf validity alone.
+    """
+    if segment and segment[0] < 32:
+        return True
+    return bool(text and re.search(r"(?<![A-Za-z])[A-Za-z](?=https?://)", text))
+
+
 def _parse_protobuf_strings(data, depth=0):
     if depth > 4 or not data:
         return []
@@ -400,11 +412,14 @@ def _parse_protobuf_strings(data, depth=0):
                     return []
                 segment = data[pos:pos + length]
                 pos += length
+                nested = _parse_protobuf_strings(segment, depth + 1)
                 text = _decode_text_segment(segment)
-                if text:
+                if nested and _prefer_nested_protobuf(segment, text):
+                    out.extend(nested)
+                elif text:
                     out.append(text)
-                else:
-                    out.extend(_parse_protobuf_strings(segment, depth + 1))
+                elif nested:
+                    out.extend(nested)
             else:
                 return []
             if pos > len(data):
