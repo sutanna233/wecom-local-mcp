@@ -1,0 +1,33 @@
+# Local runtime environments
+.venv/
+__pycache__/
+*.py[cod]
+
+# Generated local configuration and launchers
+mcp_config.generated.json
+02_启动消息采集.cmd
+03_启动只读MCP.cmd
+
+# Sensitive local data
+wxwork_keys.json
+*.sqlite
+*.sqlite-*
+*.db
+*.db-wal
+*.db-shm
+data/
+decrypted/
+logs/
+integration/
+
+# Generated exports and package artifacts
+wxwork_export/
+wxwork_decrypted/
+*.log
+*.zip
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "wecom-local-messages": {
+      "command": "C:\\path\\to\\wecom-local-mcp\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\path\\to\\wecom-local-mcp\\wecom_mcp.py"
+      ],
+      "env": {
+        "WECOM_MCP_DB": "C:\\path\\to\\wecom-local-mcp\\data\\wecom_messages.sqlite",
+        "WECOM_MCP_READ_ONLY": "1",
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  }
+}

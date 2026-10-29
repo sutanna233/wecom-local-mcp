@@ -1,0 +1,13 @@
+WeCom Local MCP deployment package
+
+No encryption keys, chat databases, decrypted snapshots, exports, logs,
+screenshots, or WXWork binaries are included.
+
+Run 01_一键部署.cmd. It creates .venv, installs pycryptodome exclusively from
+wheels/ with --no-index, detects common WXWork Data paths, writes the collector
+config, and performs the initial sync. If detection fails, set WECOM_DATA_DIR
+or pass a configuration explicitly. For a checked offline database, run
+01_一键部署.cmd -OfflineDb path\to\wecom_messages.sqlite through the same entry.
+
+Third-party WeCom decryption/export source:
+https://github.com/lyrcsjy/wechat-decrypt
