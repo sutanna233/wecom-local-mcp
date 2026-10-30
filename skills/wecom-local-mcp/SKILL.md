@@ -14,7 +14,7 @@ description: 在 Windows 离线或受限网络环境中部署、注册、验证�
 - 不擅自新建、覆盖或修补 Agent 宿主配置。只使用生成的 `mcp_config.generated.json` 进行导入；需要手工合并时，先取得用户同意，且只合并 `mcpServers["wecom-local-messages"]`。
 - 不上传或要求用户粘贴密钥、消息正文、SQLite/DB/WAL、解密快照、导出或日志。不要把 `wxwork_keys.json`、数据库或消息内容打入 ZIP。
 - 保持 `WECOM_MCP_READ_ONLY=1`，不要启用 `sync_messages`。MCP 仅走 stdio；不要增加 HTTP/SSE 服务、监听器、端口转发或外发代理。
-- 默认不启动持续采集。只有用户明确要求持续采集时，才使用部署后生成的采集启动器。
+- 在线模式部署后默认在当前用户会话后台持续采集；只需首轮同步时通过同一入口传 `-NoWatcher`。OfflineDb 始终不启动后台采集，也不重复启动已有采集器。
 
 ## 1. 定位并检查离线包
 
@@ -43,6 +43,16 @@ $env:WECOM_DEPLOY_NO_PAUSE = "1"
 if ($LASTEXITCODE -ne 0) { throw "WeCom deployment failed: $LASTEXITCODE" }
 ```
 
+在线模式完成首轮同步后，默认在当前用户会话启动后台采集器，并输出 PID、`logs/collector.pid` 状态文件以及 `data/collector.stdout.log`、`data/collector.stderr.log`。重复运行同一入口时，若 PID 对应进程仍存活则复用，不再启动第二个后台实例；`logs/collector.lock` 是采集器最终互斥保障，不要仅凭残留 PID 文件判断占用。
+
+只需部署和首轮同步、不需要后台采集时：
+
+```powershell
+& ".\01_一键部署.cmd" -NoWatcher
+```
+
+旧自动化中的 `-StartWatcher` 仍可保留，效果与默认行为相同；同时传入时 `-NoWatcher` 优先。两种开关都只通过同一 CMD 入口传递。
+
 需要显式配置时仍只使用同一入口：
 
 ```powershell
@@ -60,7 +70,7 @@ $env:WECOM_DEPLOY_NO_PAUSE = "1"
 if ($LASTEXITCODE -ne 0) { throw "OfflineDb deployment failed: $LASTEXITCODE" }
 ```
 
-OfflineDb 应是本工具链准备或验证过的消息库，不是企微原始加密数据库。入口生成只读副本及指向它的 MCP 配置；源库路径变化不会自动刷新该副本。
+OfflineDb 应是本工具链准备或验证过的消息库，不是企微原始加密数据库。入口生成只读副本及指向它的 MCP 配置；源库路径变化不会自动刷新该副本。OfflineDb 不启动后台采集，即使旧命令仍带 `-StartWatcher`。
 
 ### 部署完成判据
 
@@ -70,6 +80,7 @@ OfflineDb 应是本工具链准备或验证过的消息库，不是企微原始�
 - `.venv/Scripts/python.exe` 存在，依赖已从本地 wheel 安装。
 - 包根目录生成 `mcp_config.generated.json`。
 - 生成配置的 `command`/`args` 指向本包运行环境，`WECOM_MCP_DB` 指向本次数据库，`WECOM_MCP_READ_ONLY` 为 `"1"`。
+- 在线模式未指定 `-NoWatcher` 时，输出后台 PID、PID 状态文件和 stdout/stderr 日志路径；重复部署显示复用已有 PID。
 
 若入口失败，保留退出码和错误类别，按“排错”处理；不要绕过入口逐条手工执行内部步骤。
 
@@ -113,7 +124,7 @@ mcpServers["wecom-local-messages"]
 - `tools/list` 包含 `list_conversations`、`search_messages`、`recent_messages`、`get_message`，且不包含 `sync_messages`。
 - `list_conversations`、`recent_messages` 和 `search_messages` 可调用；有消息时验证 `get_message`。
 
-随后在 Agent 宿主中重连，并确认能看到同名四个只读工具。宿主的权限审批或 DLP 拦截属于宿主行为，不要通过修改协议或关闭只读来绕过。
+随后在 Agent 宿主中重连，并确认能看到同名五个只读工具。宿主的权限审批或 DLP 拦截属于宿主行为，不要通过修改协议或关闭只读来绕过。
 
 ## 5. 使用消息工具
 
@@ -151,6 +162,6 @@ mcpServers["wecom-local-messages"]
 | OfflineDb 报 schema、integrity、page size 或 WAL 错误 | 使用本工具链验证过的规范化消息库及配套 WAL；不要传入原始加密库。当前解密/WAL 链路要求 4096 字节页。 |
 | MCP 不出现或宿主连接失败 | 检查生成配置的绝对路径，重新导入并按宿主要求重连；不要覆盖宿主其他节点。 |
 | initialize/tools 无响应、中文乱码或协议错误 | 运行验证器，保留生成配置中的 UTF-8 环境变量；stdout 只用于 JSON-RPC，不向其中写入诊断文本。 |
-| 查询为空或数据未更新 | 先确认本机是否已同步。在线模式可重新运行唯一入口做一次同步；OfflineDb 是静态副本，需要重新部署新副本。 |
+| 查询为空或数据未更新 | 先确认本机是否已同步。在线模式检查 `logs/collector.pid` 的 `heartbeat` 和采集日志；需要时重新运行唯一入口，存活实例会复用，异常退出的 stale PID 会由采集器恢复。`-NoWatcher` 模式只完成首轮同步；OfflineDb 是静态副本，需要重新部署新副本。 |
 | `search_messages` 提示缺少 query | 提供非空关键词；只看最近消息时改用 `recent_messages`。 |
 | 移动目录后路径失效 | 在新目录重新运行唯一入口并重新导入生成配置。 |

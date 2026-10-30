@@ -51,7 +51,7 @@ Windows 下 `~` 表示当前用户目录。虽然上述路径来自官方文档�
 ## 3. 验证
 
 1. 保存后查看 `wecom-local-messages` 的状态：官方文档以 **绿色**表示连接成功，**红色**表示配置或启动异常。
-2. 运行本地 `verify_agent_deploy.py --require-data`，确认协议和四个只读工具均通过；空数据库可不加 `--require-data`，此时验证器会明确跳过 `get_message`。
+2. 运行本地 `verify_agent_deploy.py --require-data`，确认协议和五个只读工具均通过；空数据库可不加 `--require-data`，此时验证器会明确跳过 `get_message`。
 3. 在 WorkBuddy 中让 Agent 调用 `list_conversations`，参数 `{"limit":1}`，只报告成功与否和分页元数据，不展示正文。
 4. 再用用户指定的非敏感关键词调用 `search_messages`，并用返回的 `msgid` 调用 `get_message`；本地验证器同时确认未暴露 `sync_messages`。
 

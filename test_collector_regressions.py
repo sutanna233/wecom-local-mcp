@@ -141,7 +141,7 @@ class StoreMigrationTests(unittest.TestCase):
             raw = json.dumps(make_message_row(), ensure_ascii=False)
             for table, local_id in (("message_table", 10), ("message_small_table", 1)):
                 old_id = f"wxwork:{table}:{local_id}"
-                nested = make_message_row(table=table, message_id=local_id)
+                nested = make_message_row(table=table, message_id=local_id, flag=9)
                 outer = {"msgid": old_id, "raw": nested}
                 con.execute(
                     "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?)",
@@ -157,15 +157,16 @@ class StoreMigrationTests(unittest.TestCase):
 
             store = Store(str(path))
             self.assertEqual(store.count(), 1)
-            row = store._db.execute("SELECT msgid,sender_id FROM messages").fetchone()
+            row = store._db.execute("SELECT msgid,sender_id,flag FROM messages").fetchone()
             self.assertEqual(row[0], export.canonical_msgid(make_message_row()))
             self.assertEqual(row[1], 7)
+            self.assertEqual(row[2], 9)
             self.assertEqual(store._db.execute("SELECT COUNT(*) FROM hits").fetchone()[0], 1)
             self.assertEqual(store._db.execute("SELECT pushed FROM hits").fetchone()[0], 1)
             columns = [r[1] for r in store._db.execute("PRAGMA table_info(messages)")]
             self.assertEqual(columns, [
                 "msgid", "seq", "roomid", "sender", "sender_id", "msgtime",
-                "msgtype", "content", "raw", "fetched_at",
+                "msgtype", "flag", "content", "raw", "fetched_at",
             ])
             store.close()
 
@@ -174,6 +175,41 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(store.count(), 1)
             store.close()
             self.assertNotEqual(raw, "")
+
+    def test_v2_schema_adds_flag_and_backfills_nested_raw(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "v2.sqlite"
+            con = sqlite3.connect(path)
+            con.executescript("""
+                CREATE TABLE messages (
+                    msgid TEXT PRIMARY KEY, seq INTEGER, roomid TEXT, sender TEXT,
+                    sender_id INTEGER, msgtime INTEGER, msgtype INTEGER,
+                    content TEXT, raw TEXT, fetched_at INTEGER
+                );
+                CREATE TABLE hits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, msgid TEXT NOT NULL,
+                    rule TEXT NOT NULL, roomid TEXT, msgtime INTEGER, snippet TEXT,
+                    pushed INTEGER DEFAULT 0, UNIQUE(msgid,rule)
+                );
+                CREATE TABLE rooms (roomid TEXT PRIMARY KEY,name TEXT,updated_at INTEGER);
+                CREATE TABLE state (k TEXT PRIMARY KEY,v TEXT);
+                INSERT INTO state VALUES ('messages_identity_version','2');
+            """)
+            source = make_message_row(flag=131072)
+            msgid = export.canonical_msgid(source)
+            outer = {"msgid": msgid, "raw": source}
+            con.execute(
+                "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (msgid, 10, "R:1", "Alice", 7, 1000, 2, "hello",
+                 json.dumps(outer, ensure_ascii=False), 1),
+            )
+            con.commit()
+            con.close()
+
+            store = Store(str(path))
+            row = store._db.execute("SELECT msgid,flag FROM messages").fetchone()
+            self.assertEqual(row, (msgid, 131072))
+            store.close()
 
 
 class CollectorTests(unittest.TestCase):
@@ -200,16 +236,43 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(store.count(), 3)
             by_id = {
                 row[0]: row for row in store._db.execute(
-                    "SELECT msgid,content,raw,sender,sender_id FROM messages"
+                    "SELECT msgid,content,raw,sender,sender_id,flag FROM messages"
                 )
             }
             updated = by_id[export.canonical_msgid(make_message_row(message_id=10))]
             self.assertEqual(updated[1], "after")
             self.assertEqual(json.loads(updated[2])["raw"]["flag"], 9)
+            self.assertEqual(updated[5], 9)
             late = by_id[export.canonical_msgid(make_message_row(
                 message_id=5, server_id=102, sender_id=8, sequence=9, send_time=999, content="late"
             ))]
             self.assertEqual((late[3], late[4]), ("Bob", 8))
+            store.close()
+
+    def test_collector_persists_flag_and_at_users(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            create_source(root)
+            con = sqlite3.connect(root / "message.db")
+            insert_message(
+                con, "message_table", message_id=30, server_id=103,
+                content_type=1002, content="7;8", flag=8,
+            )
+            con.commit()
+            con.close()
+
+            store = Store(str(root / "derived.sqlite"))
+            scanned, inserted = collect(root, store, self_id=7)
+            self.assertEqual((scanned, inserted), (4, 3))
+            row = store._db.execute(
+                "SELECT content,flag,raw FROM messages WHERE msgtype=1002"
+            ).fetchone()
+            self.assertEqual(row[0], "@Alice @Bob")
+            self.assertEqual(row[1], 8)
+            raw = json.loads(row[2])["raw"]
+            self.assertEqual(raw["content"], "7;8")
+            self.assertEqual(raw["at_user_id"], [7, 8])
+            self.assertEqual(raw["at_user"], ["@Alice", "@Bob"])
             store.close()
 
     def test_export_counts_and_rows_share_canonical_dedupe(self):
@@ -231,6 +294,28 @@ class CollectorTests(unittest.TestCase):
 
 
 class ParserRegressionTests(unittest.TestCase):
+    def test_new_type_names_and_at_user_parsing(self):
+        self.assertEqual(
+            {key: export.MSG_TYPES[key] for key in (13, 20, 29, 35, 36, 123, 1002)},
+            {
+                13: "在线文档", 20: "媒体消息", 29: "表情", 35: "图文链接",
+                36: "微信/外部消息", 123: "混合消息", 1002: "@提及",
+            },
+        )
+        row = make_message_row(content_type=1002, content="7;8；9")
+        msg = export._build_message(
+            row, {}, {7: "Alice", 8: "Bob"}, {"R:1": {8: "Bob群昵称"}}, 7,
+        )
+        self.assertEqual(msg["content"], "7;8；9")
+        self.assertEqual(msg["display_content"], "@Alice @Bob群昵称 @9")
+        self.assertEqual(msg["at_user_id"], [7, 8, 9])
+        self.assertEqual(msg["at_user"], ["@Alice", "@Bob群昵称", "@9"])
+        self.assertEqual(msg["type_name"], "@提及")
+
+        ordinary = export._build_message(make_message_row(), {}, {7: "Alice"}, {}, 7)
+        self.assertEqual(ordinary["at_user_id"], [])
+        self.assertEqual(ordinary["at_user"], [])
+
     def test_protobuf_tag_is_not_part_of_chinese_text(self):
         raw = base64.b64decode("CkgIABJECkLlr7nnmoTvvIzlsLHmmK/ov5nkuKrvvIzmr4/lpKnnlKjkuIDnlKjvvIzorqnku5bovoXliqnovoXliqnlt6XkvZw=")
         self.assertEqual(export.decode_content(raw), "对的，就是这个，每天用一用，让他辅助辅助工作")

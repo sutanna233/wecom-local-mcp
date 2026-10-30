@@ -49,15 +49,17 @@ def fixture_messages() -> list[dict]:
     ]
 
 
-def create_store(path: Path, *, sender_column: bool = True, messages: list[dict] | None = None) -> None:
+def create_store(path: Path, *, sender_column: bool = True, flag_column: bool = False,
+                 messages: list[dict] | None = None) -> None:
     if path.exists():
         path.unlink()
     con = sqlite3.connect(path)
     sender_ddl = "sender_id INTEGER," if sender_column else ""
+    flag_ddl = "flag INTEGER," if flag_column else ""
     con.execute(
         "CREATE TABLE messages ("
         "msgid TEXT PRIMARY KEY,seq INTEGER,roomid TEXT,sender TEXT,"
-        f"{sender_ddl}msgtime INTEGER,msgtype TEXT,content TEXT,raw TEXT,fetched_at INTEGER)"
+        f"{sender_ddl}msgtime INTEGER,msgtype TEXT,{flag_ddl}content TEXT,raw TEXT,fetched_at INTEGER)"
     )
     con.execute("CREATE TABLE rooms (roomid TEXT PRIMARY KEY,name TEXT,updated_at INTEGER)")
     for index, message in enumerate(messages if messages is not None else fixture_messages()):
@@ -66,16 +68,74 @@ def create_store(path: Path, *, sender_column: bool = True, messages: list[dict]
         if sender_column:
             columns.append("sender_id")
             values.append(message["sender_id"])
-        columns.extend(["msgtime", "msgtype", "content", "raw", "fetched_at"])
+        columns.extend(["msgtime", "msgtype"])
+        values.extend([message["msgtime"], message["msgtype"]])
+        if flag_column:
+            columns.append("flag")
+            values.append(message.get("flag"))
+        columns.extend(["content", "raw", "fetched_at"])
         raw = {"raw": message["raw"]} if index % 2 else message["raw"]
         values.extend([
-            message["msgtime"], message["msgtype"], message["content"],
-            json.dumps(raw, ensure_ascii=False), 1_700_000_000 + index,
+            message["content"], json.dumps(raw, ensure_ascii=False), 1_700_000_000 + index,
         ])
         placeholders = ",".join("?" for _ in columns)
         con.execute(f"INSERT INTO messages ({','.join(columns)}) VALUES ({placeholders})", values)
     con.commit()
     con.close()
+
+
+def add_performance_indexes(path: Path, *, rooms: bool = True, fts: bool = True) -> None:
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    if rooms:
+        con.execute("ALTER TABLE rooms ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0")
+        con.execute("ALTER TABLE rooms ADD COLUMN last_time INTEGER NOT NULL DEFAULT 0")
+        con.execute("ALTER TABLE rooms ADD COLUMN kind TEXT NOT NULL DEFAULT ''")
+        stats = con.execute(
+            "SELECT roomid,COUNT(*) AS message_count,MAX(msgtime) AS last_time "
+            "FROM messages GROUP BY roomid"
+        ).fetchall()
+        for stat in stats:
+            latest = con.execute(
+                "SELECT raw FROM messages WHERE roomid=? ORDER BY msgtime DESC,msgid DESC LIMIT 1",
+                (stat["roomid"],),
+            ).fetchone()
+            raw = mcp.nested_raw(latest)
+            cid = stat["roomid"] or ""
+            name = raw.get("display_name") or raw.get("conversation") or cid
+            kind = raw.get("conversation_kind") or raw.get("kind") or mcp._conversation_kind(cid)
+            con.execute(
+                "INSERT INTO rooms(roomid,name,updated_at,message_count,last_time,kind) VALUES(?,?,0,?,?,?) "
+                "ON CONFLICT(roomid) DO UPDATE SET name=excluded.name,message_count=excluded.message_count,"
+                "last_time=excluded.last_time,kind=excluded.kind",
+                (cid, name, stat["message_count"], stat["last_time"], kind),
+            )
+    if fts:
+        con.execute(
+            "CREATE VIRTUAL TABLE messages_fts USING fts5("
+            "content,content='messages',content_rowid='rowid',tokenize='trigram')"
+        )
+        con.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+    con.commit()
+    con.close()
+
+
+def v13_fixture_messages() -> list[dict]:
+    return [
+        {"msgid": "d1", "seq": 1, "roomid": "R:a", "sender": "甲", "sender_id": 1,
+         "msgtime": T0, "msgtype": 13, "content": "  同一条\t消息 ", "flag": 5,
+         "raw": {"flag": 5, "type_name": "原始类型", "server_id": 11}},
+        # Different msgid/server_id, but the same ledger body after whitespace folding.
+        {"msgid": "d2", "seq": 2, "roomid": "R:a", "sender": "甲", "sender_id": 1,
+         "msgtime": T0, "msgtype": 13, "content": "同一条\n消息", "flag": 2,
+         "raw": {"flag": 2, "server_id": 22}},
+        {"msgid": "d3", "seq": 3, "roomid": "R:a", "sender": "乙", "sender_id": 2,
+         "msgtime": T0 + 60, "msgtype": 1002, "content": "1001;1002", "flag": 4,
+         "raw": {"flag": 4, "at_user_id": [1001, 1002], "at_user": ["@甲", "@乙"]}},
+        {"msgid": "d4", "seq": 4, "roomid": "R:b", "sender": "丙", "sender_id": 3,
+         "msgtime": T0 + 120, "msgtype": 2, "content": "其他", "flag": 0,
+         "raw": {"flag": 0, "at_user_id": "all", "at_user": "@所有人"}},
+    ]
 
 
 class MCPRegressionTests(unittest.TestCase):
@@ -196,6 +256,129 @@ class MCPRegressionTests(unittest.TestCase):
         self.assertIn("未知", unknown["conversation"])
         self.assertIn("M:999", unknown["conversation"])
         self.assertEqual(unknown["kind"], "微信联系人")
+
+    def test_v13_optional_query_flag_types_mentions_and_dedupe(self) -> None:
+        for flag_column in (False, True):
+            with self.subTest(flag_column=flag_column):
+                path = self.work / f"v13-{flag_column}.sqlite"
+                create_store(path, flag_column=flag_column, messages=v13_fixture_messages())
+                with mock.patch.object(mcp, "DB_PATH", path):
+                    self.assertEqual(mcp.search_messages({})["total"], 4)
+                    filtered = mcp.search_messages({"conversation_id": "R:a", "sender": "甲"})
+                    self.assertEqual({row["msgid"] for row in filtered["messages"]}, {"d1", "d2"})
+                    self.assertEqual(mcp.search_messages({"msgtype": 1002})["messages"][0]["msgid"], "d3")
+                    recent = mcp.recent_messages({"start_time": T0 + 60, "end_time": T0 + 120})
+                    self.assertEqual([row["msgid"] for row in recent["messages"]], ["d3"])
+                    flagged = mcp.recent_messages({"flag_mask": 3, "flag_value": 1})
+                    self.assertEqual([row["msgid"] for row in flagged["messages"]], ["d1"])
+                    self.assertEqual(mcp.search_messages({"flag_mask": 2})["total"], 3)
+
+                    first = mcp.get_message({"msgid": "d1"})
+                    second = mcp.get_message({"msgid": "d2"})
+                    self.assertEqual(first["type_name"], "原始类型")
+                    self.assertEqual(second["type_name"], "在线表格")
+                    self.assertEqual(first["flag"], 5)
+                    self.assertEqual(first["flag_bits"], [0, 2])
+                    self.assertEqual(first["dedupe_key"], second["dedupe_key"])
+                    self.assertEqual(len(first["dedupe_key"]), 64)
+                    self.assertEqual((first["dup_count"], second["dup_count"]), (2, 2))
+                    self.assertEqual(mcp.search_messages({})["total"], 4)  # no physical dedupe
+
+                    mentioned = mcp.get_message({"msgid": "d3"})
+                    self.assertEqual(mentioned["at_user_id"], [1001, 1002])
+                    self.assertEqual(mentioned["at_user"], ["@甲", "@乙"])
+                    self.assertEqual(mentioned["mentions"], [
+                        {"user_id": 1001, "name": "@甲"},
+                        {"user_id": 1002, "name": "@乙"},
+                    ])
+                    self.assertFalse(mentioned["mention_all"])
+                    legacy_all = mcp.get_message({"msgid": "d4"})
+                    self.assertEqual(legacy_all["at_user_id"], ["all"])
+                    self.assertTrue(legacy_all["mention_all"])
+                    with self.assertRaisesRegex(ValueError, "requires flag_mask"):
+                        mcp.search_messages({"flag_value": 1})
+
+    def test_v13_count_messages_dimensions_and_filters(self) -> None:
+        create_store(self.db, flag_column=True, messages=v13_fixture_messages())
+        by_conversation = mcp.count_messages({})
+        self.assertEqual((by_conversation["total"], by_conversation["count"]), (4, 4))
+        self.assertEqual(by_conversation["group_by"], ["conversation"])
+        self.assertEqual(
+            {row["conversation_id"]: row["count"] for row in by_conversation["groups"]},
+            {"R:a": 3, "R:b": 1},
+        )
+        by_sender = mcp.count_messages({"group_by": "sender", "conversation_id": "R:a"})
+        self.assertEqual({(row["sender"], row["sender_id"], row["count"]) for row in by_sender["groups"]}, {
+            ("甲", 1, 2), ("乙", 2, 1),
+        })
+        by_type = mcp.count_messages({"group_by": "msgtype"})
+        self.assertEqual({row["msgtype"]: row["count"] for row in by_type["groups"]}, {2: 1, 13: 2, 1002: 1})
+        self.assertEqual({row["type_name"] for row in by_type["groups"]}, {"文本", "在线表格", "@提及"})
+        day = datetime.fromtimestamp(T0).strftime("%Y-%m-%d")
+        by_day = mcp.count_messages({"group_by": ["day"]})
+        self.assertEqual(by_day["groups"], [{"day": day, "count": 4}])
+        combined = mcp.count_messages({"group_by": "conversation,msgtype", "query": "同一条"})
+        self.assertEqual(combined["total"], 2)
+        self.assertEqual(combined["groups"], [{"conversation_id": "R:a", "msgtype": 13, "type_name": "在线表格", "count": 2}])
+        window = mcp.count_messages({"start_time": T0 + 60, "end_time": T0 + 120})
+        self.assertEqual(window["total"], 1)
+        self.assertEqual(mcp.count_messages({"flag_mask": 3, "flag_value": 1})["total"], 1)
+
+    def test_v13_tools_and_local_type_names(self) -> None:
+        response = mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+        self.assertIn("count_messages", tools)
+        self.assertNotIn("required", tools["search_messages"]["inputSchema"])
+        expected = {13: "在线表格", 20: "媒体消息", 29: "表情", 35: "链接分享",
+                    36: "微信/外部消息", 123: "混合消息", 1002: "@提及"}
+        self.assertEqual({key: mcp.message_type_name(key) for key in expected}, expected)
+
+    def test_plain_text_mentions_and_mention_all(self) -> None:
+        messages = [{"msgid": "t1", "seq": 1, "roomid": "R:mentions", "sender": "甲", "sender_id": 1,
+                     "msgtime": T0, "msgtype": 2,
+                     "content": "请 @叶垚炜/Ye Yaowei 处理，@所有人 注意；邮箱 a@b.com 不算提及",
+                     "raw": {"conversation": "提及测试"}}]
+        create_store(self.db, messages=messages)
+        item = mcp.search_messages({"query": "处理"})["messages"][0]
+        self.assertIn({"user_id": None, "name": "@叶垚炜/Ye Yaowei"}, item["mentions"])
+        self.assertTrue(item["mention_all"])
+        self.assertNotIn({"user_id": None, "name": "@b"}, item["mentions"])
+
+    def test_rooms_statistics_cache_matches_legacy_without_raw_decoding(self) -> None:
+        baseline = mcp.list_conversations({"limit": 2})
+        baseline_remaining = mcp.list_conversations({"limit": 2, "offset": 2})
+        baseline_named = mcp.list_conversations({"query": "叶垚炜"})
+        add_performance_indexes(self.db, rooms=True, fts=False)
+        with mock.patch.object(mcp, "nested_raw", side_effect=AssertionError("raw decoded")):
+            cached = mcp.list_conversations({"limit": 2})
+            cached_remaining = mcp.list_conversations({"limit": 2, "offset": 2})
+            cached_named = mcp.list_conversations({"query": "叶垚炜"})
+        self.assertEqual(cached, baseline)
+        self.assertEqual(cached_remaining, baseline_remaining)
+        self.assertEqual(cached_named, baseline_named)
+
+    def test_trigram_join_matches_instr_and_short_query_falls_back(self) -> None:
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO messages(msgid,seq,roomid,sender,sender_id,msgtime,msgtype,content,raw,fetched_at) "
+            "VALUES('quoted',9,'R:team','张三',1001,?,'2','a\"b 100%_值','{}',1)",
+            (T0 + 500,),
+        )
+        con.commit()
+        con.close()
+        queries = ["中文项目", "alpha", "边界", 'a"b', "0%_"]
+        baseline = {query: mcp.search_messages({"query": query, "limit": 100}) for query in queries}
+        add_performance_indexes(self.db, rooms=False, fts=True)
+        with mcp.closing(mcp.connect()) as con:
+            long_source, long_params = mcp._message_search_source(con, "中文项目")
+            short_source, short_params = mcp._message_search_source(con, "边界")
+        self.assertIn("JOIN", long_source)
+        self.assertIn("messages_fts", long_source)
+        self.assertEqual(long_params, ['"中文项目"'])
+        self.assertEqual((short_source, short_params), (" FROM messages", []))
+        for query in queries:
+            with self.subTest(query=query):
+                self.assertEqual(mcp.search_messages({"query": query, "limit": 100}), baseline[query])
 
     def test_real_stdio_utf8_batch_chinese_and_pagination(self) -> None:
         env = os.environ.copy()

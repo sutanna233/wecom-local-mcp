@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-OUT = ROOT.parent / "wecom-local-mcp-v1.2.4.zip"
+OUT = ROOT.parent / "wecom-local-mcp-v1.3.0.zip"
 PREFIX = "wecom-local-mcp"
 
 FILES = [
@@ -36,7 +36,10 @@ FILES = [
     "test_pipeline.py",
     "test_collector_regressions.py",
     "test_snapshot_regressions.py",
+    "test_snapshot_performance.py",
+    "test_store_performance.py",
     "test_mcp_regressions.py",
+    "test_mcp_performance.py",
     "test_deploy_regressions.py",
     "test_mcp.py",
     "requirements.txt",
@@ -287,7 +290,9 @@ def main() -> None:
             run_strict_utf8(
                 [sys.executable, "-m", "unittest", "-v",
                  "test_pipeline.py", "test_collector_regressions.py",
-                 "test_snapshot_regressions.py", "test_mcp_regressions.py"],
+                 "test_snapshot_regressions.py", "test_snapshot_performance.py",
+                 "test_store_performance.py", "test_mcp_regressions.py",
+                 "test_mcp_performance.py"],
                 cwd=extracted,
                 env=utf8_env(),
                 timeout=90,

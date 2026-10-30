@@ -29,11 +29,18 @@ MSG_TYPES = {
     2: "文本",
     4: "图片",
     7: "语音",
+    13: "在线文档",
     14: "图片",
     15: "图片/文件",
+    20: "媒体消息",
+    29: "表情",
+    35: "图文链接",
+    36: "微信/外部消息",
     38: "应用消息",
     40: "通话/音视频",
+    123: "混合消息",
     503: "状态",
+    1002: "@提及",
     1011: "会议通知",
 }
 
@@ -533,6 +540,24 @@ def _display_message_content(content_type, content, extra_content, local_extra_c
     return f"[{_message_type_name(content_type)}]"
 
 
+def _resolve_at_users(content, conversation_id, user_map, member_names):
+    """将 1002 的分号分隔用户 ID 转为稳定的结构化 @联系人。"""
+    at_user_id = []
+    at_user = []
+    for value in re.split(r"[;；,\s]+", (content or "").strip()):
+        if not value or not value.isdigit():
+            continue
+        user_id = int(value)
+        name = (
+            member_names.get(conversation_id, {}).get(user_id)
+            or user_map.get(user_id)
+            or str(user_id)
+        )
+        at_user_id.append(user_id)
+        at_user.append(f"@{name}")
+    return at_user_id, at_user
+
+
 def _build_message(row, conv_map, user_map, member_names, self_id):
     cid = row["conversation_id"]
     sender_id = int(row["sender_id"] or 0)
@@ -547,6 +572,14 @@ def _build_message(row, conv_map, user_map, member_names, self_id):
     local_extra_content = decode_content(row["local_extra_content"])
     content_type = int(row["content_type"] or 0)
     conv = conv_map.get(cid, {})
+    display_content = _display_message_content(
+        content_type, content, extra_content, local_extra_content
+    )
+    at_user_id, at_user = [], []
+    if content_type == 1002:
+        at_user_id, at_user = _resolve_at_users(content, cid, user_map, member_names)
+        if at_user:
+            display_content = " ".join(at_user)
 
     return {
         "msgid": canonical_msgid(row),
@@ -567,9 +600,9 @@ def _build_message(row, conv_map, user_map, member_names, self_id):
         "content": content,
         "extra_content": extra_content,
         "local_extra_content": local_extra_content,
-        "display_content": _display_message_content(
-            content_type, content, extra_content, local_extra_content
-        ),
+        "display_content": display_content,
+        "at_user_id": at_user_id,
+        "at_user": at_user,
         "is_sent": self_id is not None and sender_id == self_id,
     }
 

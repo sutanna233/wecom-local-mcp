@@ -3,7 +3,8 @@ param(
     [string]$ConfigPath = $(if ($env:WECOM_CONFIG) { $env:WECOM_CONFIG } else { "" }),
     [string]$OfflineDb = "",
     [string]$PythonPath = "",
-    [switch]$StartWatcher
+    [switch]$StartWatcher,
+    [switch]$NoWatcher
 )
 
 Set-StrictMode -Version Latest
@@ -69,6 +70,20 @@ function Test-KeyRelatedFailure([object]$Failure) {
         if ($Text -match $Pattern) { return $true }
     }
     return $false
+}
+
+function Get-RunningCollectorPid([string]$StatePath) {
+    if (-not (Test-Path $StatePath -PathType Leaf)) { return $null }
+    try {
+        $State = Get-Content -Raw -Encoding UTF8 $StatePath | ConvertFrom-Json
+        $ProcessId = [int]$State.pid
+        if ($ProcessId -le 0) { return $null }
+        $Process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($Process -and -not $Process.HasExited) { return $ProcessId }
+    } catch {
+        # A partial or stale state file is recovered by the collector lock.
+    }
+    return $null
 }
 
 # Chinese launcher names are constructed at runtime so PS5.1 never has to
@@ -180,17 +195,31 @@ try {
     $WatcherLines += "`"$Python`" `"%~dp0wecom_collector.py`" --watch --poll 15"
     Write-LinesUtf8NoBom $CollectorLauncher $WatcherLines
 
-    if ($StartWatcher -and -not $OfflineDb) {
+    # StartWatcher remains accepted for compatibility; online deployment now
+    # starts the watcher by default. NoWatcher always wins, and OfflineDb is static.
+    $WatcherRequested = -not $OfflineDb -and -not $NoWatcher
+    $CollectorPidPath = Join-Path $Root "logs\collector.pid"
+    if ($WatcherRequested) {
         $CollectorOutLog = Join-Path $DataDir "collector.stdout.log"
         $CollectorErrorLog = Join-Path $DataDir "collector.stderr.log"
-        Start-Process -FilePath $Python `
-            -ArgumentList @("wecom_collector.py", "--watch", "--poll", "15") `
-            -WorkingDirectory $Root -WindowStyle Hidden `
-            -RedirectStandardOutput $CollectorOutLog `
-            -RedirectStandardError $CollectorErrorLog
-        Write-Host "Collector watcher started in the current user session."
+        $ExistingCollectorPid = Get-RunningCollectorPid $CollectorPidPath
+        if ($null -ne $ExistingCollectorPid) {
+            Write-Host "Collector watcher already running; PID=$ExistingCollectorPid"
+        } else {
+            $WatcherProcess = Start-Process -FilePath $Python `
+                -ArgumentList @("wecom_collector.py", "--watch", "--poll", "15") `
+                -WorkingDirectory $Root -WindowStyle Hidden -PassThru `
+                -RedirectStandardOutput $CollectorOutLog `
+                -RedirectStandardError $CollectorErrorLog
+            Write-Host "Collector watcher started in the current user session; PID=$($WatcherProcess.Id)"
+        }
+        Write-Host "Collector PID file: $CollectorPidPath"
         Write-Host "Collector stdout log: $CollectorOutLog"
         Write-Host "Collector stderr log: $CollectorErrorLog"
+    } elseif ($OfflineDb) {
+        Write-Host "Collector watcher not started for OfflineDb."
+    } else {
+        Write-Host "Collector watcher disabled by -NoWatcher."
     }
 
     Write-Host "[5/5] DONE"

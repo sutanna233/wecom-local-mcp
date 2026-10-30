@@ -36,6 +36,7 @@ FRAME_HEADER = 24
 WAL_MAGIC_LE = 0x377F0682
 WAL_MAGIC_BE = 0x377F0683
 WAL_VERSION = 3007000
+CACHE_VERSION = 1
 DEFAULT_NAMES = ("message.db", "session.db", "message_lookup.db", "user.db")
 LOG = logging.getLogger(__name__)
 
@@ -111,11 +112,15 @@ def _file_fingerprint(path: Path) -> tuple[int, int, int, int, int, int] | None:
     )
 
 
-def copy_stable_pair(src: Path, copied_db: Path, copied_wal: Path) -> dict:
+def copy_stable_pair(
+    src: Path, copied_db: Path, copied_wal: Path, copy_db: bool = True
+) -> dict:
     """Copy a live DB/WAL pair without ever opening either source for writing.
 
     Both files are fingerprinted before the first copy and after the last copy.
     This also detects a WAL appearing or disappearing during the operation.
+    When a decrypted baseline is reusable, ``copy_db=False`` copies only the
+    WAL while still verifying that the main DB stayed unchanged.
     """
     src = Path(src)
     copied_db = Path(copied_db)
@@ -126,8 +131,11 @@ def copy_stable_pair(src: Path, copied_db: Path, copied_wal: Path) -> dict:
         raise FileNotFoundError(src)
     before_wal = _file_fingerprint(wal_src)
     copied_wal.unlink(missing_ok=True)
+    if not copy_db:
+        copied_db.unlink(missing_ok=True)
     try:
-        shutil.copy2(src, copied_db)
+        if copy_db:
+            shutil.copy2(src, copied_db)
         if before_wal is not None:
             shutil.copy2(wal_src, copied_wal)
     except FileNotFoundError as exc:
@@ -145,9 +153,12 @@ def copy_stable_pair(src: Path, copied_db: Path, copied_wal: Path) -> dict:
             f"source {' and '.join(changed)} changed during copy; snapshot retry required"
         )
     return {
-        "db_bytes": copied_db.stat().st_size,
+        "db_bytes": copied_db.stat().st_size if copy_db else before_db[2],
+        "db_copied": copy_db,
+        "db_fingerprint": before_db,
         "wal_copied": before_wal is not None,
         "wal_bytes": copied_wal.stat().st_size if copied_wal.exists() else 0,
+        "wal_fingerprint": before_wal,
     }
 
 
@@ -407,6 +418,183 @@ def replace_snapshot_file(plain: Path, destination: Path) -> None:
                 Path(str(destination) + suffix).unlink(missing_ok=True)
 
 
+def _cache_path(destination: Path) -> Path:
+    return Path(str(destination) + ".snapshot-cache.json")
+
+
+def _fingerprints_equal(left, right) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    return tuple(left) == tuple(right)
+
+
+def _source_fingerprints(src: Path):
+    db_fingerprint = _file_fingerprint(src)
+    if db_fingerprint is None:
+        raise FileNotFoundError(src)
+    return db_fingerprint, _file_fingerprint(Path(str(src) + "-wal"))
+
+
+def _key_sha256(key: bytes | None) -> str | None:
+    return hashlib.sha256(key).hexdigest() if key is not None else None
+
+
+def _load_cache(path: Path) -> dict | None:
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(cache, dict) or cache.get("version") != CACHE_VERSION:
+        return None
+    if (
+        not isinstance(cache.get("source"), str)
+        or not isinstance(cache.get("sha256"), str)
+        or not isinstance(cache.get("encrypted"), bool)
+        or not isinstance(cache.get("db_fingerprint"), list)
+        or not isinstance(cache.get("destination_fingerprint"), list)
+        or (
+            cache.get("wal_fingerprint") is not None
+            and not isinstance(cache.get("wal_fingerprint"), list)
+        )
+    ):
+        return None
+    try:
+        if int(cache.get("wal_committed_bytes") or 0) < 0:
+            return None
+        if int(cache.get("wal_commit_dbsize") or 0) < 0:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return cache
+
+
+def _cache_identity_matches(cache: dict, src: Path, key: bytes | None) -> bool:
+    return (
+        cache.get("source") == str(src.resolve())
+        and cache.get("key_sha256") == _key_sha256(key)
+    )
+
+
+def _destination_matches_cache(cache: dict, destination: Path) -> bool:
+    return destination.is_file() and _fingerprints_equal(
+        cache.get("destination_fingerprint"), _file_fingerprint(destination)
+    )
+
+
+def _cache_unchanged(
+    cache: dict | None,
+    src: Path,
+    destination: Path,
+    key: bytes | None,
+    db_fingerprint,
+    wal_fingerprint,
+) -> bool:
+    return bool(
+        cache is not None
+        and _cache_identity_matches(cache, src, key)
+        and _fingerprints_equal(cache.get("db_fingerprint"), db_fingerprint)
+        and _fingerprints_equal(cache.get("wal_fingerprint"), wal_fingerprint)
+        and _destination_matches_cache(cache, destination)
+    )
+
+
+def _cache_reusable(
+    cache: dict | None,
+    src: Path,
+    destination: Path,
+    key: bytes | None,
+    db_fingerprint,
+) -> bool:
+    return bool(
+        cache is not None
+        and cache.get("encrypted") is True
+        and _cache_identity_matches(cache, src, key)
+        and _fingerprints_equal(cache.get("db_fingerprint"), db_fingerprint)
+        and _destination_matches_cache(cache, destination)
+    )
+
+
+def _sha256_file(path: Path, length: int | None = None) -> str:
+    digest = hashlib.sha256()
+    remaining = length
+    with Path(path).open("rb") as source:
+        while remaining is None or remaining > 0:
+            chunk_size = 1024 * 1024 if remaining is None else min(1024 * 1024, remaining)
+            chunk = source.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+            if remaining is not None:
+                remaining -= len(chunk)
+    if remaining:
+        raise SnapshotError(f"file ended before requested {length} bytes: {path}")
+    return digest.hexdigest()
+
+
+def _wal_prefix_metadata(wal_path: Path, committed_frames: int) -> tuple[int, str | None]:
+    if committed_frames <= 0:
+        return 0, None
+    prefix_bytes = WAL_HEADER + committed_frames * (FRAME_HEADER + PAGE)
+    return prefix_bytes, _sha256_file(wal_path, prefix_bytes)
+
+
+def _baseline_wal_compatible(cache: dict, copied_wal: Path) -> bool:
+    """The destination must represent a committed prefix of the current WAL."""
+    previous_bytes = int(cache.get("wal_committed_bytes") or 0)
+    if previous_bytes == 0:
+        # No WAL frames were present in the cached destination, so it is the
+        # decrypted main-DB baseline and can accept any valid WAL generation.
+        return True
+    expected_hash = cache.get("wal_committed_sha256")
+    if (
+        not expected_hash
+        or not copied_wal.is_file()
+        or copied_wal.stat().st_size < previous_bytes
+    ):
+        return False
+    return _sha256_file(copied_wal, previous_bytes) == expected_hash
+
+
+def _write_cache(path: Path, cache: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, staging_name = tempfile.mkstemp(prefix=".snapshot_cache_", dir=path.parent)
+    staging = Path(staging_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(cache, output, ensure_ascii=False, indent=2)
+        os.replace(staging, path)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
+def _remove_destination_sidecars(destination: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        Path(str(destination) + suffix).unlink(missing_ok=True)
+
+
+def _unchanged_result(
+    rel: str,
+    destination: Path,
+    cache: dict,
+    attempt: int,
+    warnings: list[str],
+) -> dict:
+    return {
+        "name": rel,
+        "bytes": destination.stat().st_size,
+        "wal_frames_applied": 0,
+        "wal_frames_skipped": 0,
+        "wal_commit_dbsize": int(cache.get("wal_commit_dbsize") or 0),
+        "attempts": attempt,
+        "warnings": list(warnings),
+        "sha256": cache["sha256"],
+        "skipped": True,
+        "reused_baseline": False,
+        "db_copied": False,
+        "cache_status": "unchanged",
+    }
+
+
 def snapshot_one(
     rel: str, db_dir: Path, out_dir: Path, keys: dict, attempts: int = 3
 ) -> dict:
@@ -416,44 +604,140 @@ def snapshot_one(
     if attempts < 1:
         raise ValueError("attempts must be at least 1")
     key = key_for(keys, rel)
+    destination = out_dir / rel
+    cache_path = _cache_path(destination)
     last_error: Exception | None = None
     retry_warnings: list[str] = []
     for attempt in range(1, attempts + 1):
         try:
+            db_fingerprint, wal_fingerprint = _source_fingerprints(src)
+            cache = _load_cache(cache_path)
+            if _cache_unchanged(
+                cache, src, destination, key, db_fingerprint, wal_fingerprint
+            ) and _source_fingerprints(src) == (db_fingerprint, wal_fingerprint):
+                _remove_destination_sidecars(destination)
+                return _unchanged_result(
+                    rel, destination, cache, attempt, retry_warnings
+                )
+
+            reuse = _cache_reusable(
+                cache, src, destination, key, db_fingerprint
+            )
+            fell_back = False
             with tempfile.TemporaryDirectory(prefix="wecom_snapshot_") as td:
                 work = Path(td)
                 copied_db = work / "source.db"
                 copied_wal = work / "source.db-wal"
-                copy_stable_pair(src, copied_db, copied_wal)
-                with copied_db.open("rb") as fh:
-                    head = fh.read(PAGE)
-                validate_database_page_size(head)
-                wal_header = validate_wal_header(copied_wal)
-
+                copied = copy_stable_pair(
+                    src, copied_db, copied_wal, not reuse
+                )
                 plain = work / "plain.db"
                 warnings: list[str] = []
-                commit_dbsize = 0
-                if is_plain_sqlite_page(head):
-                    shutil.copy2(copied_db, plain)
-                    if copied_wal.exists():
-                        shutil.copy2(copied_wal, Path(str(plain) + "-wal"))
-                    checkpoint = checkpoint_copied_db(plain)
-                    patched = checkpoint["checkpointed_frames"]
-                    skipped = 0
-                else:
-                    if key is None:
-                        raise SnapshotError("no verified key for encrypted DB")
-                    decrypt_wxwork_database(str(copied_db), str(plain), key)
-                    wal_result = apply_committed_wal(
-                        copied_wal, plain, key, header=wal_header
+                patched = skipped = commit_dbsize = committed_frames = 0
+                encrypted = False
+
+                if reuse and not _fingerprints_equal(
+                    cache["db_fingerprint"], copied["db_fingerprint"]
+                ):
+                    warnings.append("source DB changed; decrypted baseline invalidated")
+                    reuse = False
+                    fell_back = True
+                if reuse:
+                    wal_header = validate_wal_header(copied_wal)
+                    if not _baseline_wal_compatible(cache, copied_wal):
+                        warnings.append(
+                            "current WAL does not extend the cached committed prefix; "
+                            "decrypted baseline invalidated"
+                        )
+                        reuse = False
+                        fell_back = True
+                if not reuse and not copied["db_copied"]:
+                    copied = copy_stable_pair(src, copied_db, copied_wal)
+
+                if reuse:
+                    encrypted = True
+                    try:
+                        shutil.copy2(destination, plain)
+                    except OSError as exc:
+                        warnings.append(f"decrypted baseline unreadable: {exc}; full rebuild")
+                        reuse = False
+                        fell_back = True
+                    else:
+                        wal_result = apply_committed_wal(
+                            copied_wal, plain, key, header=wal_header
+                        )
+                        patched = wal_result.applied
+                        skipped = wal_result.skipped
+                        commit_dbsize = wal_result.commit_dbsize
+                        committed_frames = wal_result.committed_frames
+                        warnings.extend(wal_result.warnings)
+                        try:
+                            check_db(plain)
+                        except SnapshotError as exc:
+                            warnings.append(
+                                f"reused baseline failed integrity_check: {exc}; full rebuild"
+                            )
+                            reuse = False
+                            fell_back = True
+
+                if not reuse:
+                    if not copied["db_copied"]:
+                        copied = copy_stable_pair(src, copied_db, copied_wal)
+                    with copied_db.open("rb") as fh:
+                        head = fh.read(PAGE)
+                    validate_database_page_size(head)
+                    wal_header = validate_wal_header(copied_wal)
+                    patched = skipped = commit_dbsize = committed_frames = 0
+                    if is_plain_sqlite_page(head):
+                        encrypted = False
+                        shutil.copy2(copied_db, plain)
+                        plain_wal = Path(str(plain) + "-wal")
+                        plain_wal.unlink(missing_ok=True)
+                        if copied_wal.exists():
+                            shutil.copy2(copied_wal, plain_wal)
+                        checkpoint = checkpoint_copied_db(plain)
+                        patched = checkpoint["checkpointed_frames"]
+                    else:
+                        encrypted = True
+                        if key is None:
+                            raise SnapshotError("no verified key for encrypted DB")
+                        decrypt_wxwork_database(str(copied_db), str(plain), key)
+                        wal_result = apply_committed_wal(
+                            copied_wal, plain, key, header=wal_header
+                        )
+                        patched = wal_result.applied
+                        skipped = wal_result.skipped
+                        commit_dbsize = wal_result.commit_dbsize
+                        committed_frames = wal_result.committed_frames
+                        warnings.extend(wal_result.warnings)
+                    check_db(plain)
+
+                if encrypted:
+                    prefix_bytes, prefix_hash = _wal_prefix_metadata(
+                        copied_wal, committed_frames
                     )
-                    patched = wal_result.applied
-                    skipped = wal_result.skipped
-                    commit_dbsize = wal_result.commit_dbsize
-                    warnings.extend(wal_result.warnings)
-                check_db(plain)
-                destination = out_dir / rel
+                else:
+                    prefix_bytes, prefix_hash = 0, None
                 replace_snapshot_file(plain, destination)
+                snapshot_hash = _sha256_file(destination)
+                new_cache = {
+                    "version": CACHE_VERSION,
+                    "source": str(src.resolve()),
+                    "key_sha256": _key_sha256(key),
+                    "db_fingerprint": copied["db_fingerprint"],
+                    "wal_fingerprint": copied["wal_fingerprint"],
+                    "destination_fingerprint": _file_fingerprint(destination),
+                    "encrypted": encrypted,
+                    "wal_committed_bytes": prefix_bytes,
+                    "wal_committed_sha256": prefix_hash,
+                    "wal_commit_dbsize": commit_dbsize,
+                    "sha256": snapshot_hash,
+                }
+                try:
+                    _write_cache(cache_path, new_cache)
+                except OSError as exc:
+                    warnings.append(f"snapshot cache write failed: {exc}")
+
                 all_warnings = retry_warnings + warnings
                 for warning in all_warnings:
                     LOG.warning("%s: %s", rel, warning)
@@ -465,7 +749,13 @@ def snapshot_one(
                     "wal_commit_dbsize": commit_dbsize,
                     "attempts": attempt,
                     "warnings": all_warnings,
-                    "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+                    "sha256": snapshot_hash,
+                    "skipped": False,
+                    "reused_baseline": reuse,
+                    "db_copied": bool(copied["db_copied"]),
+                    "cache_status": (
+                        "wal_reused" if reuse else "full_fallback" if fell_back else "full"
+                    ),
                 }
         except UnsupportedPageSize:
             raise

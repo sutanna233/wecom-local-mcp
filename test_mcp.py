@@ -80,7 +80,7 @@ def main() -> None:
             assert [answer["id"] for answer in answers] == [2, 3], answers
             tools = answers[0]["result"]["tools"]
             names = {tool["name"] for tool in tools}
-            assert {"search_messages", "get_message", "list_conversations", "recent_messages"} <= names
+            assert {"search_messages", "get_message", "list_conversations", "recent_messages", "count_messages"} <= names
             assert "sync_messages" not in names  # default read-only mode
 
             result = call("tools/call", {"name": "search_messages", "arguments": {"query": "我问问", "limit": 1}})
@@ -89,6 +89,9 @@ def main() -> None:
             message = payload["messages"][0]
             assert "我问问" in message["content"]
             assert message["msgtype"] == 2 and message["type_name"] == "文本"
+            assert message["flag"] == 0 and message["flag_bits"] == []
+            assert message["mentions"] == [] and message["mention_all"] is False
+            assert len(message["dedupe_key"]) == 64 and message["dup_count"] == 1
             full = call("tools/call", {"name": "get_message", "arguments": {"msgid": message["msgid"]}})["structuredContent"]
             assert full["msgid"] == message["msgid"]
             assert "我问问" in full["content"]
@@ -96,12 +99,19 @@ def main() -> None:
             assert conversations["count"] == 1
             recent = call("tools/call", {"name": "recent_messages", "arguments": {"limit": 1}})["structuredContent"]
             assert (recent["count"], recent["total"], recent["next_offset"]) == (1, 2, 1)
+            unfiltered = call("tools/call", {"name": "search_messages", "arguments": {"conversation_id": "S:100_999"}})["structuredContent"]
+            assert unfiltered["total"] == 2
+            counted = call("tools/call", {"name": "count_messages", "arguments": {"group_by": "msgtype"}})["structuredContent"]
+            assert counted["total"] == 2
+            assert counted["groups"] == [{"msgtype": 2, "type_name": "文本", "count": 2}]
             print("MCP_INITIALIZE=OK")
             print("MCP_JSON_RPC_BATCH=OK")
             print("MCP_TOOLS_LIST=OK")
             print("MCP_SEARCH_READ=OK")
             print("MCP_PORTABLE_CONVERSATIONS=OK")
             print("MCP_PAGINATION=OK")
+            print("MCP_OPTIONAL_QUERY_AND_COUNT=OK")
+            print("MCP_SUMMARY_V13=OK")
             print("MCP_GBK_ENV_UTF8_STDIO=OK")
             print("MCP_TEST_MESSAGE_ID=" + message["msgid"])
         finally:

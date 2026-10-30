@@ -18,6 +18,7 @@ READ_TOOLS = {
     "search_messages",
     "recent_messages",
     "get_message",
+    "count_messages",
 }
 
 
@@ -162,6 +163,7 @@ def main() -> int:
         tool_call(3, "list_conversations", {"limit": 1}),
         tool_call(4, "recent_messages", {"limit": 1}),
         tool_call(5, "search_messages", {"query": "__wecom_skill_verify_no_match__", "limit": 1}),
+        tool_call(6, "count_messages", {"group_by": "day"}),
     ]
     responses = run_rpc(server, env, initial_requests, args.timeout)
     initialized = result(responses[1])
@@ -181,6 +183,10 @@ def main() -> int:
     recent = structured(responses[4])
     validate_page(recent, "messages")
     validate_page(structured(responses[5]), "messages")
+    counted = structured(responses[6])
+    if not isinstance(counted.get("total"), int) or not isinstance(counted.get("groups"), list):
+        raise RuntimeError("count_messages returned invalid aggregate metadata")
+    print("MCP_COUNT_MESSAGES=OK")
     print("MCP_INITIALIZE=OK")
     print("MCP_TOOLS_LIST=OK")
     print("MCP_READ_ONLY=OK")

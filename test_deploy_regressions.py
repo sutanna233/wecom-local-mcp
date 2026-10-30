@@ -217,14 +217,20 @@ class PowerShellDeploymentTests(unittest.TestCase):
             encoding="ascii",
         )
 
-    def run_deploy(self, failure_text: str, start_watcher: bool = False) -> subprocess.CompletedProcess[str]:
+    def run_deploy(
+        self,
+        failure_text: str,
+        start_watcher: bool = False,
+        no_watcher: bool = False,
+        offline_db: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.update({
             "PATH": str(self.fake_bin) + os.pathsep + env.get("PATH", ""),
             "FAKE_PYTHON_LOG": str(self.log_path),
             "FAKE_KEY_FILE": str(self.key_path),
             "FAKE_FAILURE_MARKER": str(self.marker_path),
-            "FAKE_FAIL_ONCE": "1",
+            "FAKE_FAIL_ONCE": "1" if failure_text else "0",
             "FAKE_FAILURE_TEXT": failure_text,
             "PYTHONUTF8": "1",
             "PYTHONIOENCODING": "utf-8",
@@ -236,6 +242,12 @@ class PowerShellDeploymentTests(unittest.TestCase):
         ]
         if start_watcher:
             command.append("-StartWatcher")
+        if no_watcher:
+            command.append("-NoWatcher")
+        if offline_db:
+            source = self.root / "offline-input.sqlite"
+            source.write_bytes(b"synthetic offline input")
+            command += ["-OfflineDb", str(source)]
         return subprocess.run(
             command,
             env=env,
@@ -254,7 +266,7 @@ class PowerShellDeploymentTests(unittest.TestCase):
                 and (option is None or option in row["args"])]
 
     def test_workdir_key_retry_launchers_utf8_and_hidden_logs(self):
-        result = self.run_deploy("wxSQLite3 AES-128 key validation failed", start_watcher=True)
+        result = self.run_deploy("wxSQLite3 AES-128 key validation failed")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         key_runs = self.records("find_wxwork_keys.py")
         collector_runs = self.records("wecom_collector.py", "--once")
@@ -300,6 +312,12 @@ class PowerShellDeploymentTests(unittest.TestCase):
         self.assertTrue(stderr_log.is_file(), result.stdout + result.stderr)
         self.assertIn("Collector stdout log:", result.stdout)
         self.assertIn("Collector stderr log:", result.stdout)
+        self.assertIn("Collector PID file:", result.stdout)
+        self.assertIn("PID=", result.stdout)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not self.records("wecom_collector.py", "--watch"):
+            time.sleep(0.05)
+        self.assertEqual(len(self.records("wecom_collector.py", "--watch")), 1)
         self.assertIn("collector.stdout.log", result.stdout)
         self.assertIn("collector.stderr.log", result.stdout)
 
@@ -309,6 +327,57 @@ class PowerShellDeploymentTests(unittest.TestCase):
         self.assertEqual(len(self.records("find_wxwork_keys.py")), 1)
         self.assertEqual(len(self.records("wecom_collector.py", "--once")), 1)
         self.assertNotIn("refreshing the local key once", result.stdout)
+
+    def test_no_watcher_disables_default_even_with_legacy_switch(self):
+        result = self.run_deploy("", start_watcher=True, no_watcher=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.records("wecom_collector.py", "--watch"), [])
+        self.assertFalse((self.root / "data" / "collector.stdout.log").exists())
+        self.assertIn("Collector watcher disabled by -NoWatcher", result.stdout)
+
+    def test_offline_db_never_starts_watcher(self):
+        result = self.run_deploy("", start_watcher=True, offline_db=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.records("wecom_collector.py", "--watch"), [])
+        self.assertFalse((self.root / "data" / "collector.stdout.log").exists())
+        self.assertIn("Collector watcher not started for OfflineDb", result.stdout)
+
+    def test_live_collector_pid_prevents_duplicate_background_start(self):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+        def stop_process():
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=10)
+
+        self.addCleanup(stop_process)
+        pid_path = self.root / "logs" / "collector.pid"
+        pid_path.parent.mkdir(parents=True)
+        pid_path.write_text(json.dumps({
+            "pid": process.pid,
+            "started_at": time.time(),
+            "heartbeat": time.time(),
+        }), encoding="utf-8")
+        result = self.run_deploy("")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.records("wecom_collector.py", "--watch"), [])
+        self.assertIn(f"Collector watcher already running; PID={process.pid}", result.stdout)
+        self.assertIn(r"logs\collector.pid", result.stdout)
+
+    def test_legacy_start_watcher_recovers_stale_pid(self):
+        stale = subprocess.Popen([sys.executable, "-c", "pass"])
+        stale.wait(timeout=10)
+        pid_path = self.root / "logs" / "collector.pid"
+        pid_path.parent.mkdir(parents=True)
+        pid_path.write_text(json.dumps({"pid": stale.pid}), encoding="utf-8")
+        result = self.run_deploy("", start_watcher=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not self.records("wecom_collector.py", "--watch"):
+            time.sleep(0.05)
+        self.assertEqual(len(self.records("wecom_collector.py", "--watch")), 1)
+        self.assertIn("Collector watcher started", result.stdout)
+        self.assertNotIn("already running", result.stdout)
 
 
 FAKE_SETUP = r"""
@@ -330,9 +399,16 @@ python.write_text("synthetic launcher", encoding="ascii")
 
 FAKE_DEPLOY = r"""param(
     [string]$PythonPath = "",
-    [string]$OfflineDb = ""
+    [string]$OfflineDb = "",
+    [switch]$StartWatcher,
+    [switch]$NoWatcher
 )
-$Payload = @{ python = $PythonPath; offline_db = $OfflineDb } | ConvertTo-Json
+$Payload = @{
+    python = $PythonPath
+    offline_db = $OfflineDb
+    start_watcher = $StartWatcher.IsPresent
+    no_watcher = $NoWatcher.IsPresent
+} | ConvertTo-Json
 [IO.File]::WriteAllText($env:FAKE_DEPLOY_LOG, $Payload, [Text.UTF8Encoding]::new($false))
 exit [int]$env:FAKE_DEPLOY_EXIT
 """
@@ -387,6 +463,13 @@ class BatchLauncherTests(unittest.TestCase):
     def test_bat_propagates_deploy_exit_code(self):
         result = self.run_bat(deploy_exit=23)
         self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+
+    def test_bat_forwards_no_watcher(self):
+        result = self.run_bat("-NoWatcher")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        deploy = json.loads(self.deploy_log.read_text(encoding="utf-8"))
+        self.assertTrue(deploy["no_watcher"])
+        self.assertFalse(deploy["start_watcher"])
 
     def test_bat_stops_when_offline_setup_fails(self):
         result = self.run_bat(setup_exit=9)

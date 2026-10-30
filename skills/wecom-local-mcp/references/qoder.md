@@ -62,9 +62,10 @@
    - `search_messages`
    - `recent_messages`
    - `get_message`
+   - `count_messages`
 3. 确认没有 `sync_messages`。首次工具调用若出现确认提示，由用户核对后批准，不为了省事开启所有后续工具的自动执行。
 4. 做一次最小调用：让 Agent 使用 `list_conversations`，参数 `{"limit":1}`，只报告调用是否成功和分页元数据，不展示消息正文。
-5. 再用用户指定的非敏感关键词调用 `search_messages`，从结果选 `msgid` 调用 `get_message`。也可仅运行本地验证器完成协议和四工具检查。
+5. 再用用户指定的非敏感关键词调用 `search_messages`，从结果选 `msgid` 调用 `get_message`。也可仅运行本地验证器完成协议和五工具检查。
 
 连接失败时先运行本地验证器并检查绝对路径、STDIO 类型和环境变量。不要点击可能联网下载依赖的 Quick Fix；本链路只允许随包 wheel 离线安装。
 

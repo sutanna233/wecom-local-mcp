@@ -6,13 +6,15 @@
 
 - 16 个加密数据库通过密钥校验；快照通过 SQLite `integrity_check`。
 - WAL 校验 header/frame checksum，只应用到最近 commit，并按 commit `dbsize` 截断。
-- 本次源消息表共 12,939 行；规范化后 **12,917 条消息**，移除 22 条重复记录。
+- 本次源消息表共 12,980 行；规范化后 **12,958 条消息**，移除 22 条重复记录。
 - 共 192 个有消息的会话；`msgid` 无重复，`sender_id` 全部写入，`msgtype` 物理类型为 INTEGER。
 - MCP 的 initialize、tools/list、tools/call、JSON-RPC batch、中文搜索、完整读取、分页和强制 GBK 环境下的 UTF-8 stdio 均已验证。
 - 离线 DB/WAL 复制、checkpoint、完整性及 schema 校验均有合成回归测试。
 - v1.2.1 修正 protobuf 嵌套字段解析：不再把字段标签当成正文首字母，同时避免把正常文件名误判为 protobuf。
 - v1.2.2 收紧纯文本快速通道，修复 `eh08` 等紧凑 protobuf 残留前缀；图片等二进制消息不再猜测 GBK/UTF-16，优先显示清理后的本地附件路径。
 - v1.2.3 恢复单字消息解析，ASCII、中文和 emoji 单字不再退化为二进制占位。
+- v1.3.0 增加 flag 迁移与按位过滤、结构化和文本 @提及、时间窗空查询、内容重复键/计数、count_messages 多维聚合及五工具自动验证。
+- 大库优化：快照指纹与基线复用、高位点+512 回看、默认 3600 秒周期全量、rooms 预聚合、external-content trigram FTS（rowid 映射），短查询/旧库回退 instr；dup_count 查询使用 roomid+msgtime 复合索引。
 
 这些数字是本次验证时的快照，不代表服务器上的全部历史或其他账号的数据；后续新消息会改变总数。
 
@@ -54,13 +56,21 @@ python wecom_collector.py --watch --poll 15
 python wecom_mcp.py
 ```
 
-重新导出本地快照：
+重新导出本地快照（一次生成三种格式）：
 
 ```powershell
 cd third_party\wecom-decrypt
-python export_wxwork_messages.py --formats json
+python export_wxwork_messages.py --formats csv,html,json
 cd ..\..
 ```
+
+`--formats` 接受逗号分隔的 `csv`、`html`、`json`，未提供时默认只导出 CSV。先运行 `python export_wxwork_messages.py --list` 可查看会话 ID；再用一个或多个 `--conversation "R:example"` 限定导出范围。默认读取 `wxwork_decrypted_dir`，写入 `wxwork_export_dir`（默认为 `third_party/wecom-decrypt/wxwork_export`），每个会话一个目录：
+
+- `messages.csv`：UTF-8 with BOM，便于 Excel 打开，包含展示正文、身份字段和 `flag`。
+- `messages.html`：静态可读聊天记录，按日期分组并区分发送/接收。
+- `messages.json`：UTF-8 结构化数据，包含会话、消息数和完整解析字段。
+
+导出会按 canonical 消息身份消除跨表重复，但不会把附件转换成正文。导出目录包含敏感消息，和密钥、数据库一样不应上传或打入发布 ZIP。
 
 密钥失效时，保持企微登录，在 `third_party\wecom-decrypt` 执行 `python find_wxwork_keys.py`。密钥文件 `wxwork_keys.json` 属于敏感文件，不要上传或放入部署 ZIP。
 
@@ -68,7 +78,8 @@ cd ..\..
 
 - 有非零 `server_id` 时，使用 `conversation_id + server_id` 形成 v2 canonical ID；跨 `message_table`、`message_small_table` 的同一消息只保留一条，主表优先。
 - `server_id=0` 时使用来源表和本地 `message_id` 兜底。
-- 旧 SQLite 会自动迁移并合并重复记录；`sender_id` 独立保存。
+- 旧 SQLite 会自动迁移并合并重复记录；`sender_id` 独立保存。v1.3 增加 `messages.flag INTEGER NOT NULL DEFAULT 0`，历史行从 `raw.flag` 回填，MCP 对旧 schema/raw 仍有兜底。
+- 类型 1002 的 @提及会把正文中的用户 ID 解析为 `raw.at_user_id` 和 `raw.at_user` 数组；联系人名称不可用时保留数字 ID。
 - 每轮全量重扫并 UPSERT，可覆盖低位点晚到、正文变化和撤回标志；物理删除不会自动删除下游行。
 - 全量重扫复杂度为 O(N)，适合当前本地规模；大型部署应另外评估分区/增量策略。
 - 发送人名称能从联系人/群成员映射取得时使用名称；无法取得时保留数字 ID，不虚构名称。MCP 可按名称或 ID 搜索。
@@ -80,11 +91,18 @@ cd ..\..
 默认只读工具：
 
 - `list_conversations`：会话、类型、去重后的消息数和最近时间。
-- `search_messages`：正文关键词，支持会话、发送人名称/ID、时间范围和分页。
-- `recent_messages`：最近消息，支持会话和分页。
+- `search_messages`：正文关键词可选；省略或留空时保留会话、发送人、消息类型、时间和 `flag` 过滤，不再要求必须有正文条件。
+- `recent_messages`：最近消息，支持会话、发送人、消息类型、时间范围、`flag` 和分页。
+- `count_messages`：按 `conversation`、`sender`、`msgtype` 或 `day` 聚合消息数量，支持时间窗。`group_by` 接受字符串、逗号分隔字符串或字符串数组，默认 `conversation`；还可使用 `query`、`conversation_id`、`sender`、`msgtype`、`start_time`、`end_time`、`flag_mask`、`flag_value` 过滤。返回 `{total,count,group_by,groups}`，其中 `total=count=过滤后的消息记录数`，不是分组数；`groups` 每行含 `count`，按维度另含 `conversation_id`、`sender+sender_id`、`msgtype+type_name` 或本地日期 `day(YYYY-MM-DD)`。
 - `get_message`：按 `msgid` 读取完整正文及解析字段。
 
-列表和查询均返回：`count`（本页条数）、`total`（总命中数）、`offset`、`has_more`、`next_offset`。消息的 `msgtype` 为整数，另提供 `type_name`。
+列表和分页查询均返回：`count`（本页条数）、`total`（总命中数）、`offset`、`has_more`、`next_offset`。消息的 `msgtype` 为整数，`type_name` 优先采用快照中的 `raw.type_name`，否则使用本地类型表；v1.3 补充 13（在线文档）、20（媒体消息）、29（表情）、35（图文链接）、36（微信/外部消息）、123（混合消息）和 1002（@提及）。
+
+消息摘要还包含：
+
+- `flag` / `flag_bits`：原始整数位标记及从 0 开始的置位位置列表（`5 → [0,2]`）；`search_messages`、`recent_messages`、`count_messages` 使用 `(flag & flag_mask) == flag_value` 过滤。提供掩码时 `flag_value` 默认 0，单独提供 `flag_value` 报错。位含义取决于消息类型和客户端版本，不统一解释为已读或撤回。
+- `dedupe_key` / `dup_count`：对 JSON `[conversation_id,msgtime,normalized_content]` 做 SHA-256，正文 trim 并折叠连续空白；`dup_count` 是全库同键的不同 `msgid` 数，不受当前过滤/分页影响。只标注，不删除记录，也不改变分页或聚合计数。
+- `at_user_id` / `at_user`：@联系人 ID 和带 @ 显示文本数组；`mentions` 为 `{user_id,name}` 数组，`mention_all` 由 ID、名称或正文线索推导。当前真实 1002 样本未观察到 @all 哨兵，不能据此假定所有企微版本使用相同编码。
 
 时间采用**半开区间**：`start_time` 包含，`end_time` 不包含。date-only 的结束日期包含该本地日期整天，内部转换为次日午夜；带偏移 ISO 按偏移转换，无偏移 ISO/date-only 按服务器本地时区。
 
@@ -117,7 +135,7 @@ python prepare_offline_db.py "D:\source\wecom_messages.sqlite" "D:\target\wecom_
 - Qoder：`skills/wecom-local-mcp/references/qoder.md` 与 `qoder.mcp.json`，支持当前版本的 JSON 导入或 STDIO 表单。
 - WorkBuddy：`skills/wecom-local-mcp/references/workbuddy.md` 与 `workbuddy.mcp.json`，支持用户级或项目级 MCP 配置。
 - 两者都以部署后生成的 `mcp_config.generated.json` 为权威来源，不分别手工猜测路径。
-- 可用 `skills/wecom-local-mcp/scripts/verify_agent_deploy.py --require-data` 验证 initialize、四个只读工具和完整消息读取。
+- 可用 `skills/wecom-local-mcp/scripts/verify_agent_deploy.py --require-data` 验证 initialize、核心只读工具和完整消息读取；`count_messages` 另通过 `tools/list` 和一次聚合调用核对。
 
 ## 测试与打包
 
