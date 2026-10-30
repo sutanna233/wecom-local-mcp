@@ -90,8 +90,10 @@ function Get-RunningCollectorPid([string]$StatePath) {
 # decode non-ASCII source text.
 $CollectorLauncherName = "02_" + (ConvertFrom-CodePoints @(0x542F, 0x52A8, 0x6D88, 0x606F, 0x91C7, 0x96C6)) + ".cmd"
 $McpLauncherName = "03_" + (ConvertFrom-CodePoints @(0x542F, 0x52A8, 0x53EA, 0x8BFB)) + "MCP.cmd"
+$WebLauncherName = "04_" + (ConvertFrom-CodePoints @(0x542F, 0x52A8, 0x6D88, 0x606F)) + "WebUI.cmd"
 $CollectorLauncher = Join-Path $Root $CollectorLauncherName
 $McpLauncher = Join-Path $Root $McpLauncherName
+$WebLauncher = Join-Path $Root $WebLauncherName
 
 try {
     $env:PYTHONUTF8 = "1"
@@ -195,6 +197,18 @@ try {
     $WatcherLines += "`"$Python`" `"%~dp0wecom_collector.py`" --watch --poll 15"
     Write-LinesUtf8NoBom $CollectorLauncher $WatcherLines
 
+    $WebLines = @(
+        "@echo off",
+        "chcp 65001 >nul",
+        "cd /d `"%~dp0`"",
+        "set `"PYTHONUTF8=1`"",
+        "set `"PYTHONIOENCODING=utf-8`"",
+        "set `"WECOM_MCP_DB=$DbPath`"",
+        "set `"WECOM_MCP_READ_ONLY=1`""
+    )
+    $WebLines += "`"$Python`" `"%~dp0wecom_webui.py`" --host 127.0.0.1 --port 8765"
+    Write-LinesUtf8NoBom $WebLauncher $WebLines
+
     # StartWatcher remains accepted for compatibility; online deployment now
     # starts the watcher by default. NoWatcher always wins, and OfflineDb is static.
     $WatcherRequested = -not $OfflineDb -and -not $NoWatcher
@@ -206,11 +220,22 @@ try {
         if ($null -ne $ExistingCollectorPid) {
             Write-Host "Collector watcher already running; PID=$ExistingCollectorPid"
         } else {
-            $WatcherProcess = Start-Process -FilePath $Python `
-                -ArgumentList @("wecom_collector.py", "--watch", "--poll", "15") `
-                -WorkingDirectory $Root -WindowStyle Hidden -PassThru `
-                -RedirectStandardOutput $CollectorOutLog `
-                -RedirectStandardError $CollectorErrorLog
+            $ProxyBackup = @{}
+            foreach ($Name in @('NO_PROXY', 'no_proxy', 'HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy')) {
+                $ProxyBackup[$Name] = [Environment]::GetEnvironmentVariable($Name, 'Process')
+                [Environment]::SetEnvironmentVariable($Name, $null, 'Process')
+            }
+            try {
+                $WatcherProcess = Start-Process -FilePath $Python `
+                    -ArgumentList @("wecom_collector.py", "--watch", "--poll", "15") `
+                    -WorkingDirectory $Root -WindowStyle Hidden -PassThru `
+                    -RedirectStandardOutput $CollectorOutLog `
+                    -RedirectStandardError $CollectorErrorLog
+            } finally {
+                foreach ($Name in $ProxyBackup.Keys) {
+                    [Environment]::SetEnvironmentVariable($Name, $ProxyBackup[$Name], 'Process')
+                }
+            }
             Write-Host "Collector watcher started in the current user session; PID=$($WatcherProcess.Id)"
         }
         Write-Host "Collector PID file: $CollectorPidPath"
@@ -226,6 +251,7 @@ try {
     Write-Host "MCP config: $(Join-Path $Root 'mcp_config.generated.json')"
     Write-Host "MCP launcher: $McpLauncher"
     Write-Host "Collector launcher: $CollectorLauncher"
+    Write-Host "WebUI launcher: $WebLauncher (http://127.0.0.1:8765)"
     Write-Host "Message DB: $DbPath"
     Write-Host "Import the generated MCP config into your Agent manually; no Agent settings were changed."
 } catch {

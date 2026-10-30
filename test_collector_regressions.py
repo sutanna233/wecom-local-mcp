@@ -372,7 +372,9 @@ class ParserRegressionTests(unittest.TestCase):
 class WatchRetryTests(unittest.TestCase):
     def test_watch_logs_and_retries_instead_of_dying(self):
         fake_store = unittest.mock.MagicMock()
+        fake_instance = unittest.mock.MagicMock()
         with (
+            patch.object(collector_module, "CollectorInstance", return_value=fake_instance),
             patch.object(collector_module, "load_settings", return_value=(Path("db"), Path("out"), {})),
             patch.object(collector_module, "Store", return_value=fake_store),
             patch.object(collector_module, "configure_logging", return_value=Path("test.log")),

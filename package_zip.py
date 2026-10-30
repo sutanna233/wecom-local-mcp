@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-OUT = ROOT.parent / "wecom-local-mcp-v1.3.0.zip"
+OUT = ROOT.parent / "wecom-local-mcp-v1.4.0.zip"
 PREFIX = "wecom-local-mcp"
 
 FILES = [
@@ -29,6 +29,7 @@ FILES = [
     "skills/wecom-local-mcp/scripts/verify_agent_deploy.py",
     "wheels/pycryptodome-4.2.0-cp39-abi3-win_amd64.whl",
     "wecom_mcp.py",
+    "wecom_webui.py",
     "wecom_collector.py",
     "wecom_snapshot.py",
     "prepare_offline_db.py",
@@ -40,6 +41,7 @@ FILES = [
     "test_store_performance.py",
     "test_mcp_regressions.py",
     "test_mcp_performance.py",
+    "test_webui.py",
     "test_deploy_regressions.py",
     "test_mcp.py",
     "requirements.txt",
@@ -292,7 +294,7 @@ def main() -> None:
                  "test_pipeline.py", "test_collector_regressions.py",
                  "test_snapshot_regressions.py", "test_snapshot_performance.py",
                  "test_store_performance.py", "test_mcp_regressions.py",
-                 "test_mcp_performance.py"],
+                 "test_mcp_performance.py", "test_webui.py"],
                 cwd=extracted,
                 env=utf8_env(),
                 timeout=90,
